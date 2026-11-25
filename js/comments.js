@@ -1,9 +1,17 @@
-// Comments under each article: sign in with Google, read and post.
+// Comments under each article: sign in, read and post.
+//
+// Sign-in is the same interview session the interview form uses
+// (Google, Instagram, LINE, or email). If the reader is already
+// signed in, they can post straight away — no Google token needed.
+// Otherwise the Google sign-in button is shown, plus a line pointing
+// to the email option on /share-your-story/.
 //
 // The section carries everything this script needs as data attributes:
 // the post slug, the language, the API base (empty = same origin), and
 // the Google OAuth client id (empty = sign-in not set up yet; the list
 // still shows). The ID token is kept in memory only, never in storage.
+// The session stays in its HttpOnly cookie; no email address, session
+// id, or token is ever stored in localStorage.
 //
 // Comments render as plain text — no HTML from readers is ever inserted.
 // A comment with a video gets the same tap-to-load facade the articles
@@ -25,10 +33,15 @@
   var form = document.getElementById("comments-form");
   var asLine = document.getElementById("comments-as");
   var textField = document.getElementById("comments-text");
+  var socialField = document.getElementById("comments-social");
   var videoField = document.getElementById("comments-video");
   var result = document.getElementById("comments-result");
   var token = null;
   var myName = "";
+  // True when the reader is signed in via the interview session
+  // (Google, Instagram, LINE, or email) — they can post without a
+  // Google token, and the Worker reads the session cookie.
+  var sessionSignedIn = false;
 
   function api(path) {
     return apiBase + path;
@@ -93,7 +106,14 @@
     }
     comments.forEach(function (c) {
       var li = document.createElement("li");
-      li.className = "comment";
+      li.className = "comment" + (c.kind === "update" ? " comment--update" : "") + (c.pending ? " comment--pending" : "");
+
+      if (c.kind === "update") {
+        var updateLabel = document.createElement("p");
+        updateLabel.className = "comment__update-label";
+        updateLabel.textContent = "Update from Jonathan's social media";
+        li.appendChild(updateLabel);
+      }
 
       var head = document.createElement("div");
       head.className = "comment__head";
@@ -115,6 +135,15 @@
       name.className = "comment__name";
       name.textContent = c.name || "A reader";
       head.appendChild(name);
+      if (c.social) {
+        var social = document.createElement("a");
+        social.className = "comment__social";
+        social.href = c.social;
+        social.target = "_blank";
+        social.rel = "noopener";
+        social.textContent = "on " + (c.socialLabel || "social media");
+        head.appendChild(social);
+      }
       if (c.author) {
         var badge = document.createElement("span");
         badge.className = "comment__author";
@@ -129,11 +158,41 @@
       body.appendChild(textEl(c.text));
       li.appendChild(body);
 
+      if (c.kind === "update" && c.source) {
+        var source = document.createElement("p");
+        source.className = "comment__source";
+        var sourceLink = document.createElement("a");
+        sourceLink.href = c.source;
+        sourceLink.target = "_blank";
+        sourceLink.rel = "noopener";
+        sourceLink.textContent = "See the post on " + (c.sourceLabel || "social media");
+        source.appendChild(sourceLink);
+        li.appendChild(source);
+      }
+
       if (c.videoId) {
         var videoWrap = document.createElement("div");
         videoWrap.className = "comment__video";
         videoWrap.appendChild(facadeEl(c.videoId));
         li.appendChild(videoWrap);
+      }
+
+      if (c.pending) {
+        var waiting = document.createElement("p");
+        waiting.className = "comment__waiting";
+        waiting.textContent = "Waiting for approval — only you can see this.";
+        li.appendChild(waiting);
+      }
+
+      if (c.canApprove) {
+        var approve = document.createElement("button");
+        approve.type = "button";
+        approve.className = "comment__approve";
+        approve.textContent = "Approve";
+        approve.addEventListener("click", function () {
+          approveComment(c.id);
+        });
+        li.appendChild(approve);
       }
 
       if (c.canDelete) {
@@ -183,6 +242,21 @@
       .catch(function (err) { say(err.message || "That comment could not be deleted."); });
   }
 
+  function approveComment(id) {
+    if (!token) return;
+    fetch(api("/api/comment/approve"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential: token, id: id }),
+    })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data.error) throw new Error(data.error);
+        load();
+      })
+      .catch(function (err) { say(err.message || "That comment could not be approved."); });
+  }
+
   function decodePayload(jwt) {
     try {
       var payload = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
@@ -204,8 +278,50 @@
   }
 
   function startSignIn() {
+    // Already signed in via the interview session (Google, Instagram,
+    // LINE, or email)? Then no Google button is needed — the reader
+    // can post straight away, and the Worker reads the session cookie.
+    fetch("/api/interview/me")
+      .then(function (res) { return res.json(); })
+      .then(function (me) {
+        if (me && me.signedIn) {
+          sessionSignedIn = true;
+          // "Signed in with email" when an email session has no name.
+          myName = me.name || (me.provider === "email" ? "Signed in with email" : "You");
+          if (note) note.textContent = "Signed in — comments show your real name.";
+          if (signinBox) signinBox.textContent = "";
+          if (asLine) asLine.textContent = "Commenting as " + myName + ".";
+          if (form) form.hidden = false;
+          return;
+        }
+        showGoogleOrEmail();
+      })
+      .catch(function () { showGoogleOrEmail(); });
+  }
+
+  function googleConsent() {
+    if (window.JMConsent && window.JMConsent.choice) return window.JMConsent.choice();
+    try { return localStorage.getItem("cookie-consent"); } catch (e) { return null; }
+  }
+
+  function showGoogleOrEmail() {
+    // Not signed in by any method: the Google button, plus a line
+    // pointing to the email option on /share-your-story/.
+    if (note) {
+      note.textContent = "Sign in to comment — with Google below, or with email on the Share your story page (a code is sent to your address).";
+    }
     if (!clientId) {
       if (note) note.textContent = "Comments open soon — sign-in with Google is being set up.";
+      return;
+    }
+    // Google's sign-in button loads a script from accounts.google.com
+    // and Google may set its own cookies, so it only loads after the
+    // visitor accepts cookies (same rule as the interview form in
+    // js/ask.js, and as the privacy page promises). Instagram, LINE
+    // and email sign-in load nothing from a third party, so they work
+    // either way — the note points at them instead.
+    if (googleConsent() !== "accepted") {
+      if (note) note.textContent = "Google sign-in needs cookies — accept cookies to use it, or sign in with Instagram, LINE or email on the Share your story page. You can change your mind with “Cookie settings” at the bottom of the page.";
       return;
     }
     if (window.google && window.google.accounts && window.google.accounts.id) {
@@ -225,37 +341,56 @@
 
   function showButton() {
     if (!window.google || !window.google.accounts || !window.google.accounts.id) return;
+    if (signinBox && signinBox.children.length) return; // already rendered
     window.google.accounts.id.initialize({ client_id: clientId, callback: onSignedIn });
     if (signinBox) {
       window.google.accounts.id.renderButton(signinBox, { theme: "outline", size: "large" });
     }
   }
 
+  // If the visitor accepts cookies later, load the Google button then
+  // (same pattern as the interview form in js/ask.js).
+  window.addEventListener("cookie-consent", function (e) {
+    if (e.detail !== "accepted") return;
+    if (token || sessionSignedIn) return; // already signed in
+    if (signinBox && signinBox.children.length) return; // button already there
+    if (form && !form.hidden) return; // form already showing
+    showGoogleOrEmail();
+  });
+
   if (form) {
     form.addEventListener("submit", function (e) {
       e.preventDefault();
-      if (!token) {
-        say("Sign in with Google first.");
+      if (!token && !sessionSignedIn) {
+        say("Sign in first — with Google, Instagram, LINE, or email — so the site knows the comment is really yours.");
         return;
       }
       var text = textField.value.trim();
+      var social = socialField ? socialField.value.trim() : "";
       var video = videoField.value.trim();
       if (!text) {
         say("Write a comment first.");
         return;
       }
       say("Posting…");
+      // A Google token goes in the body when there is one; otherwise
+      // the Worker reads the interview session cookie.
+      var payload = { post: thread, text: text, social: social, video: video };
+      if (token) payload.credential = token;
       fetch(api("/api/comment"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ credential: token, post: thread, text: text, video: video }),
+        body: JSON.stringify(payload),
       })
         .then(function (res) { return res.json(); })
         .then(function (data) {
           if (data.error) throw new Error(data.error);
           textField.value = "";
+          if (socialField) socialField.value = "";
           videoField.value = "";
-          say("Posted — thank you.");
+          say(data.comment && data.comment.status === "pending"
+            ? "Posted — it will show here once Jonathan has had a look at it."
+            : "Posted — thank you.");
           load();
         })
         .catch(function (err) { say(err.message || "That comment did not post — please try again."); });
